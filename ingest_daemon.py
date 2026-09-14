@@ -185,6 +185,13 @@ class Config:
         return self.vault / "karpathy_ingest.log"
 
     @property
+    def auto_link_enabled(self) -> bool:
+        env_val = os.environ.get("ENABLE_AUTO_LINK", "").lower()
+        if env_val in ("true", "1", "yes"):
+            return True
+        return self._raw.get("enableAutoLink", False)
+
+    @property
     def ignore_dirs(self) -> list[str]:
         wiki_abs = str(self.vault / self.wiki_folder)
         return [
@@ -481,6 +488,101 @@ class WikiWriter:
         return target
 
 # ---------------------------------------------------------------------------
+# Auto-Linker (Inyección de Enlaces Mágicos)
+# ---------------------------------------------------------------------------
+class AutoLinker:
+    def __init__(self, config: Config, db: IngestionStateDB, logger: logging.Logger) -> None:
+        self.config = config
+        self.db = db
+        self.logger = logger
+        self._lock = asyncio.Lock()
+        self._is_running = False
+
+    def _get_terms(self) -> dict[str, str]:
+        terms = {}
+        if self.config.wiki_concepts_dir.exists():
+            for p in self.config.wiki_concepts_dir.glob("*.md"):
+                term = p.stem.replace("-", " ")
+                terms[term] = f"{self.config.wiki_folder}/concepts/{p.stem}"
+        if self.config.wiki_entities_dir.exists():
+            for p in self.config.wiki_entities_dir.glob("*.md"):
+                term = p.stem.replace("-", " ")
+                terms[term] = f"{self.config.wiki_folder}/entities/{p.stem}"
+        return terms
+
+    def _apply_links(self, content: str, terms: dict[str, str]) -> tuple[str, int]:
+        total_replacements = 0
+        parts = content.split('```')
+        
+        for term, target in terms.items():
+            if len(term) <= 3:
+                continue
+            
+            pattern = re.compile(rf'(?<!\[\[)(?<!\[)\b({re.escape(term)})\b(?!\]\])(?!\])(?!\))', flags=re.IGNORECASE)
+            
+            def replacer(match):
+                nonlocal total_replacements
+                total_replacements += 1
+                return f"[[{target}|{match.group(1)}]]"
+
+            for i in range(0, len(parts), 2):
+                parts[i] = pattern.sub(replacer, parts[i])
+                
+        return '```'.join(parts), total_replacements
+
+    async def run_full_pass(self) -> None:
+        if not self.config.auto_link_enabled:
+            return
+
+        if self._is_running:
+            return
+            
+        async with self._lock:
+            self._is_running = True
+            try:
+                self.logger.info("🔗 Auto-Linker: Iniciando escaneo de enlaces mágicos en la bóveda...")
+                terms = await asyncio.to_thread(self._get_terms)
+                if not terms:
+                    return
+
+                linked_files = 0
+                total_links = 0
+
+                for folder in self.config.watched_folders:
+                    watch_dir = self.config.vault / folder
+                    if not watch_dir.exists():
+                        continue
+                        
+                    for md_file in watch_dir.rglob("*.md"):
+                        abs_path = str(md_file.resolve())
+                        if any(abs_path.startswith(d) for d in self.config.ignore_dirs):
+                            continue
+
+                        try:
+                            content = await asyncio.to_thread(md_file.read_text, encoding="utf-8")
+                        except OSError:
+                            continue
+
+                        new_content, count = await asyncio.to_thread(self._apply_links, content, terms)
+                        
+                        if count > 0 and new_content != content:
+                            await asyncio.to_thread(md_file.write_text, new_content, encoding="utf-8")
+                            new_hash = await asyncio.to_thread(sha256_of_file, md_file)
+                            rel = str(md_file.relative_to(self.config.vault))
+                            await asyncio.to_thread(self.db.upsert, rel, new_hash, status="ok")
+                            
+                            linked_files += 1
+                            total_links += count
+                            self.logger.debug("  🔗 Auto-Linker: %d enlaces inyectados en %s", count, rel)
+
+                if linked_files > 0:
+                    self.logger.info("🔗 Auto-Linker: Pass completado. %d enlaces inyectados en %d notas.", total_links, linked_files)
+                else:
+                    self.logger.info("🔗 Auto-Linker: Pass completado. No se encontraron nuevas menciones.")
+            finally:
+                self._is_running = False
+
+# ---------------------------------------------------------------------------
 # Ingestion Pipeline
 # ---------------------------------------------------------------------------
 class IngestionPipeline:
@@ -491,12 +593,14 @@ class IngestionPipeline:
         generator: WikiGenerator,
         writer:    WikiWriter,
         logger:    logging.Logger,
+        auto_linker: AutoLinker = None,
     ) -> None:
         self.config    = config
         self.db        = db
         self.generator = generator
         self.writer    = writer
         self.logger    = logger
+        self.auto_linker = auto_linker
 
     async def process(self, file_path: Path) -> None:
         rel = str(file_path.relative_to(self.config.vault))
@@ -531,6 +635,12 @@ class IngestionPipeline:
         self.logger.info("  ✅ Generated %d wiki file(s) from: %s", len(written), rel)
 
         await asyncio.to_thread(self.db.upsert, rel, current_hash, status="ok")
+        
+        # Trigger Auto-Linker asynchronously if enabled and concepts/entities were created
+        if self.auto_linker:
+            has_new_knowledge = any("concepts" in str(w) or "entities" in str(w) for w in written)
+            if has_new_knowledge:
+                asyncio.create_task(self.auto_linker.run_full_pass())
 
 # ---------------------------------------------------------------------------
 # File System Watcher (Watchdog to Asyncio Bridge)
@@ -679,7 +789,8 @@ async def async_main(args: argparse.Namespace, vault_path: Path) -> None:
     db        = IngestionStateDB(config.db_path)
     generator = WikiGenerator(config, logger)
     writer    = WikiWriter(config, logger)
-    pipeline  = IngestionPipeline(config, db, generator, writer, logger)
+    auto_linker = AutoLinker(config, db, logger)
+    pipeline  = IngestionPipeline(config, db, generator, writer, logger, auto_linker)
 
     loop = asyncio.get_running_loop()
     handler = MarkdownEventHandler(config, pipeline, logger, loop)
@@ -709,6 +820,8 @@ async def async_main(args: argparse.Namespace, vault_path: Path) -> None:
 
     if not args.no_initial_scan:
         await initial_scan(config, pipeline, logger)
+        if config.auto_link_enabled:
+            await auto_linker.run_full_pass()
 
     stop_event = asyncio.Event()
 
