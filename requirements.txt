@@ -1,0 +1,4 @@
+# KarpathyWiki Ingest Daemon — Python Dependencies
+watchdog>=4.0.0          # File system event monitoring
+openai>=1.40.0           # OpenAI-compatible client (used for Gemini via OpenAI API)
+python-dotenv>=1.0.0     # Load API key from .env file

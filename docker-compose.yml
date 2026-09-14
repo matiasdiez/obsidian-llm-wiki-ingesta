@@ -1,0 +1,11 @@
+services:
+  karpathy-wiki-ingest:
+    build: .
+    image: karpathy-wiki-ingest
+    container_name: karpathy-wiki-ingest
+    restart: unless-stopped
+    volumes:
+      - ${VAULT_PATH}:/vault
+    env_file:
+      - .env
+    command: /vault --request-interval ${REQUEST_INTERVAL:-120}

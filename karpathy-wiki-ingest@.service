@@ -1,0 +1,42 @@
+[Unit]
+Description=KarpathyWiki Obsidian Ingestion Daemon
+Documentation=https://github.com/green-dalii/obsidian-llm-wiki
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# ── Change these two lines to match your setup ───────────────────────────────
+# Your Linux username
+User=%i
+# Absolute path to your Obsidian vault
+Environment="VAULT_PATH=/home/%i/Documents/ObsidianVault"
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Absolute path to the directory containing ingest_daemon.py
+WorkingDirectory=/home/%i/karpathy-wiki-ingest
+
+# Python executable — use the venv if you created one
+ExecStart=/home/%i/karpathy-wiki-ingest/venv/bin/python \
+    /home/%i/karpathy-wiki-ingest/ingest_daemon.py \
+    ${VAULT_PATH} \
+    --log-level INFO
+
+# Restart policy
+Restart=on-failure
+RestartSec=15s
+
+# Environment — set the Gemini API key here if you don't use a .env file
+# EnvironmentFile=/home/%i/karpathy-wiki-ingest/.env
+# Environment="GEMINI_API_KEY=your_key_here"
+
+# Output captured to systemd journal (use: journalctl -u karpathy-wiki-ingest@USERNAME)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=karpathy-wiki-ingest
+
+# Security hardening (optional, remove if causing issues)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

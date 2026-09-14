@@ -1,0 +1,18 @@
+# Environment variables (API keys and paths)
+.env
+
+# Database and logs
+ingestion_state.db
+karpathy_ingest.log
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
