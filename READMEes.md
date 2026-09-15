@@ -22,6 +22,7 @@ Daemon autónomo y asíncrono en Python que automatiza la generación de notas w
 6. **Compatibilidad Docker Multiplataforma:** Detección automática con fallback a `PollingObserver` para contenedores sobre macOS y Windows donde `inotify` no se propaga a través de volúmenes compartidos.
 7. **🧠 Embeddings Locales y Búsqueda Vectorial:** Integración con ChromaDB y Google `text-embedding-004`. Indexa la base de conocimiento localmente en disco y enlaza de forma autónoma conceptos semánticamente afines.
 8. **🏠 Soporte Plug-and-Play para Modelos Locales (Ollama / LM Studio):** Ejecución 100% offline y gratuita sin depender de APIs en la nube. Incluye fallback automático si el servidor local no soporta `beta.chat.completions.parse`, retrocediendo a `json_object` y validando con Pydantic. Inyección automática de API key ficticia para `localhost`.
+9. **🔔 Notificaciones Nativas de Escritorio:** Recibe notificaciones toast inmediatas y discretas del sistema operativo (vía `plyer`) con un resumen inteligente cada vez que se extraen nuevos conceptos o entidades mientras escribes. Mecanismo resiliente que ignora caídas en entornos sin interfaz gráfica o Docker.
 
 ---
 
@@ -87,6 +88,9 @@ REQUEST_INTERVAL=120
 # OPENAI_BASE_URL=http://localhost:11434/v1
 # MODEL_NAME=llama3.1:8b
 # EMBEDDING_MODEL_NAME=nomic-embed-text
+
+# Opcional: Notificaciones de sistema
+# ENABLE_NOTIFICATIONS=true
 ```
 
 | Variable | Requerido | Valor recomendado / Descripción |
@@ -97,6 +101,7 @@ REQUEST_INTERVAL=120
 | `WATCHED_FOLDERS` | No | Lista de carpetas a monitorear separadas por coma. Si se omite, lee `watchedFolders` del plugin en `data.json`, o monitorea todo el vault. |
 | `ENABLE_AUTO_LINK` | No | Activa la inyección automática de enlaces mágicos `[[wiki]]` en notas antiguas cuando se extraen nuevos conceptos. (`true`/`false`) |
 | `ENABLE_VECTOR_SEARCH` | No | Genera embeddings (`text-embedding-004` o modelo local) en ChromaDB y añade "Conceptos Relacionados Semánticamente" al final de cada concepto nuevo. (`true`/`false`) |
+| `ENABLE_NOTIFICATIONS` | No | Envía notificaciones de escritorio del SO cuando se extraen conceptos exitosamente (requiere ejecución local, puede fallar en Docker). (`true`/`false`) |
 | `OPENAI_BASE_URL` | No | URL base personalizada para servidores locales compatibles con OpenAI (ej. `http://localhost:11434/v1` para Ollama, `http://localhost:1234/v1` para LM Studio). También acepta `LOCAL_API_BASE_URL`. Si apunta a `localhost` o `127.0.0.1`, no requiere `GEMINI_API_KEY`. |
 | `MODEL_NAME` | No | Sobrescribe el nombre del modelo LLM (ej. `llama3.1:8b`, `qwen2.5:7b`, `mistral:7b`). Por defecto: `gemini-2.5-flash-lite`. |
 | `EMBEDDING_MODEL_NAME` | No | Sobrescribe el nombre del modelo de embeddings para búsqueda vectorial (ej. `nomic-embed-text`, `bge-m3`). Por defecto: `text-embedding-004`. |
@@ -327,6 +332,23 @@ El daemon gestiona esto de forma completamente automática y transparente:
 2. Si el servidor local responde con `BadRequestError`, captura la excepción y retrocede de inmediato a `chat.completions.create` con `response_format={"type": "json_object"}`, inyectando instrucciones estrictas de formato JSON en el prompt.
 3. Limpia automáticamente cualquier bloque de código markdown (````json ... ````) que el modelo local añada.
 4. Valida y deserializa el JSON directamente con `WikiResponse.model_validate_json(...)` de Pydantic antes de escribir cualquier archivo en tu bóveda.
+
+---
+
+## 🔔 Notificaciones Nativas de Escritorio
+
+Si ejecutas el daemon directamente en tu máquina local (Linux, macOS o Windows mediante Systemd o Python nativo), puedes habilitar notificaciones toast en tiempo real en tu sistema operativo:
+
+- **Resumen Inteligente:** Notifica cada vez que se extraen nuevos conocimientos con éxito, por ejemplo:
+  > **KarpathyWiki**  
+  > *Extraídos 2 conceptos y 1 entidades de 'Inferencia Activa'*
+- **Asíncrono y No Bloqueante:** Se despacha a través de `asyncio.to_thread` para no interrumpir el flujo del event loop ni la detección de notas.
+- **Resiliente ante Fallos:** Si se ejecuta en entornos headless, servidores sin display gráfico o dentro de contenedores Docker, captura de forma segura cualquier excepción sin interrumpir la ejecución del daemon.
+- **Activación:**
+  ```ini
+  ENABLE_NOTIFICATIONS=true
+  ```
+  *(Requiere `plyer>=2.1.0` en `requirements.txt`).*
 
 ---
 

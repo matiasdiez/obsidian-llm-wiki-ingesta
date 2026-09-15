@@ -211,6 +211,13 @@ class Config:
         return self._raw.get("enableVectorSearch", False)
 
     @property
+    def notifications_enabled(self) -> bool:
+        env_val = os.environ.get("ENABLE_NOTIFICATIONS", "").lower()
+        if env_val in ("true", "1", "yes"):
+            return True
+        return self._raw.get("enableNotifications", False)
+
+    @property
     def ignore_dirs(self) -> list[str]:
         wiki_abs = str(self.vault / self.wiki_folder)
         return [
@@ -705,6 +712,33 @@ class VectorStore:
             return []
 
 # ---------------------------------------------------------------------------
+# Notifier (Notificaciones de Escritorio)
+# ---------------------------------------------------------------------------
+class Notifier:
+    def __init__(self, config: Config, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+        
+    def notify(self, title: str, message: str) -> None:
+        if not self.config.notifications_enabled:
+            return
+            
+        try:
+            from plyer import notification
+            notification.notify(
+                title=title,
+                message=message,
+                app_name="KarpathyWiki",
+                timeout=5
+            )
+        except Exception as e:
+            self.logger.debug("No se pudo enviar notificación de escritorio: %s", e)
+
+    async def async_notify(self, title: str, message: str) -> None:
+        if self.config.notifications_enabled:
+            await asyncio.to_thread(self.notify, title, message)
+
+# ---------------------------------------------------------------------------
 # Ingestion Pipeline
 # ---------------------------------------------------------------------------
 class IngestionPipeline:
@@ -717,6 +751,7 @@ class IngestionPipeline:
         logger:    logging.Logger,
         auto_linker: AutoLinker = None,
         vector_store: VectorStore = None,
+        notifier: Notifier = None,
     ) -> None:
         self.config    = config
         self.db        = db
@@ -725,6 +760,7 @@ class IngestionPipeline:
         self.logger    = logger
         self.auto_linker = auto_linker
         self.vector_store = vector_store
+        self.notifier = notifier
 
     async def process(self, file_path: Path) -> None:
         rel = str(file_path.relative_to(self.config.vault))
@@ -790,6 +826,20 @@ class IngestionPipeline:
             has_new_knowledge = any("concepts" in str(w) or "entities" in str(w) for w in written)
             if has_new_knowledge:
                 asyncio.create_task(self.auto_linker.run_full_pass())
+                
+        # Send desktop notification
+        if self.notifier and written:
+            n_concepts = sum(1 for w in written if "concepts" in str(w))
+            n_entities = sum(1 for w in written if "entities" in str(w))
+            parts = []
+            if n_concepts:
+                parts.append(f"{n_concepts} conceptos")
+            if n_entities:
+                parts.append(f"{n_entities} entidades")
+                
+            if parts:
+                msg = f"Extraídos {' y '.join(parts)} de '{file_path.stem}'"
+                asyncio.create_task(self.notifier.async_notify("KarpathyWiki", msg))
 
 # ---------------------------------------------------------------------------
 # File System Watcher (Watchdog to Asyncio Bridge)
@@ -940,7 +990,8 @@ async def async_main(args: argparse.Namespace, vault_path: Path) -> None:
     writer    = WikiWriter(config, logger)
     auto_linker = AutoLinker(config, db, logger)
     vector_store = VectorStore(config, generator._client, logger) if config.vector_search_enabled else None
-    pipeline  = IngestionPipeline(config, db, generator, writer, logger, auto_linker, vector_store)
+    notifier = Notifier(config, logger)
+    pipeline  = IngestionPipeline(config, db, generator, writer, logger, auto_linker, vector_store, notifier)
 
     loop = asyncio.get_running_loop()
     handler = MarkdownEventHandler(config, pipeline, logger, loop)

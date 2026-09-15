@@ -28,6 +28,7 @@ This companion daemon provides:
 7. **Cross-Platform Docker Reliability:** Auto-detects runtime environment and falls back to `PollingObserver` on macOS/Windows Docker mounts where native `inotify` events do not propagate.
 8. **🧠 Local Vector Embeddings (Semantic Search):** Powered by ChromaDB and Google's `text-embedding-004`. Embeds and indexes your generated wiki notes locally, discovering non-obvious conceptual links and automatically injecting semantically related concepts.
 9. **🏠 Plug-and-Play Local Models (Ollama / LM Studio):** Run 100% offline without API keys or costs. Seamlessly points to any OpenAI-compatible local server (`OPENAI_BASE_URL`), auto-injects dummy API keys for localhost, and features a transparent fallback from JSON Schema to standard `json_object` + Pydantic validation if the local engine does not support `beta.chat.completions.parse`.
+10. **🔔 Native Desktop Notifications:** Receive instant, non-intrusive OS notifications (via `plyer`) summarizing newly extracted concepts and entities as you write. Features a resilient fallback that gracefully ignores display errors in headless or Docker environments.
 
 ---
 
@@ -102,6 +103,9 @@ REQUEST_INTERVAL=120
 # OPENAI_BASE_URL=http://localhost:11434/v1
 # MODEL_NAME=llama3.1:8b
 # EMBEDDING_MODEL_NAME=nomic-embed-text
+
+# Optional: Desktop system notifications when new concepts are extracted
+# ENABLE_NOTIFICATIONS=true
 ```
 
 ### 3. Build and launch
@@ -130,6 +134,7 @@ tail -f /path/to/your/vault/karpathy_ingest.log
 | `WATCHED_FOLDERS` | No | *from plugin* | Comma-separated list of folders to watch within the vault. If unset, automatically reads `watchedFolders` from `.obsidian/plugins/karpathywiki/data.json`, or monitors the whole vault. |
 | `ENABLE_AUTO_LINK` | No | `false` | Scans old notes and injects `[[wiki]]` links magically when new concepts/entities are generated. |
 | `ENABLE_VECTOR_SEARCH` | No | `false` | Generates local embeddings via Gemini `text-embedding-004` (or local embedding model) and stores them in ChromaDB. Automatically appends "Semantically Related Concepts" to new concepts. |
+| `ENABLE_NOTIFICATIONS` | No | `false` | Sends native OS desktop notifications upon successful extraction (requires running locally, may not work in Docker). |
 | `OPENAI_BASE_URL` | No | *Gemini API* | Custom base URL for OpenAI-compatible local endpoints (e.g., `http://localhost:11434/v1` for Ollama, `http://localhost:1234/v1` for LM Studio). Also accepts `LOCAL_API_BASE_URL`. When pointing to `localhost` or `127.0.0.1`, `GEMINI_API_KEY` is not required. |
 | `MODEL_NAME` | No | `gemini-2.5-flash-lite` | Override LLM model name (e.g., `llama3.1:8b`, `qwen2.5:7b`, `mistral:7b`). |
 | `EMBEDDING_MODEL_NAME` | No | `text-embedding-004` | Override embedding model name for vector search (e.g., `nomic-embed-text`, `bge-m3`, `all-minilm`). |
@@ -218,6 +223,23 @@ The daemon handles this automatically:
 2. If the local server throws a `BadRequestError`, it seamlessly falls back to standard `chat.completions.create` with `response_format={"type": "json_object"}` and appends strict schema instructions to the prompt.
 3. Automatically strips any markdown fences (````json ... ````) returned by local LLMs.
 4. Validates the resulting JSON payload through `WikiResponse.model_validate_json(...)` to guarantee full schema integrity before writing to your vault.
+
+---
+
+## 🔔 Native Desktop Notifications
+
+If you run the daemon natively on your desktop (Linux, macOS, or Windows via Systemd or Python), you can enable real-time OS toast notifications:
+
+- **Smart Summaries:** Emits a notification whenever new knowledge is successfully written, e.g.:
+  > **KarpathyWiki**  
+  > *Extraídos 2 conceptos y 1 entidades de 'Active Inference'*
+- **Non-Blocking & Asynchronous:** Dispatched asynchronously via `asyncio.to_thread` so file ingestion and watcher loops are never paused.
+- **Headless & Docker Resilient:** If running inside Docker or a headless server without a desktop environment/display server, notification failures are caught and silenced safely without crashing the service.
+- **How to Enable:**
+  ```ini
+  ENABLE_NOTIFICATIONS=true
+  ```
+  *(Requires `plyer>=2.1.0` in `requirements.txt`).*
 
 ---
 
