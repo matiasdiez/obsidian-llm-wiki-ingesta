@@ -192,6 +192,13 @@ class Config:
         return self._raw.get("enableAutoLink", False)
 
     @property
+    def vector_search_enabled(self) -> bool:
+        env_val = os.environ.get("ENABLE_VECTOR_SEARCH", "").lower()
+        if env_val in ("true", "1", "yes"):
+            return True
+        return self._raw.get("enableVectorSearch", False)
+
+    @property
     def ignore_dirs(self) -> list[str]:
         wiki_abs = str(self.vault / self.wiki_folder)
         return [
@@ -583,6 +590,82 @@ class AutoLinker:
                 self._is_running = False
 
 # ---------------------------------------------------------------------------
+# Vector Store (ChromaDB para Búsqueda Semántica)
+# ---------------------------------------------------------------------------
+class VectorStore:
+    def __init__(self, config: Config, client: AsyncOpenAI, logger: logging.Logger):
+        self.config = config
+        self.client = client
+        self.logger = logger
+        
+        try:
+            import chromadb
+            self.chromadb = chromadb
+        except ImportError:
+            self.logger.error("❌ chromadb no está instalado. Ejecuta: pip install chromadb")
+            sys.exit(1)
+            
+        chroma_path = self.config.vault / ".obsidian" / "plugins" / "karpathywiki" / "chroma_db"
+        self.chroma_client = self.chromadb.PersistentClient(path=str(chroma_path))
+        self.collection = self.chroma_client.get_or_create_collection(
+            name="wiki_knowledge",
+            metadata={"hnsw:space": "cosine"}
+        )
+
+    async def _get_embedding(self, text: str) -> list[float]:
+        for attempt in range(3):
+            try:
+                response = await self.client.embeddings.create(
+                    input=[text],
+                    model="text-embedding-004"
+                )
+                return response.data[0].embedding
+            except Exception as e:
+                if attempt == 2:
+                    self.logger.error("Error generando embedding: %s", e)
+                    raise
+                await asyncio.sleep(2 ** attempt)
+        return []
+
+    async def upsert_file(self, file_path: Path, content: str, doc_type: str) -> None:
+        rel_id = str(file_path.relative_to(self.config.vault))
+        try:
+            emb = await self._get_embedding(content)
+            await asyncio.to_thread(
+                self.collection.upsert,
+                ids=[rel_id],
+                embeddings=[emb],
+                documents=[content],
+                metadatas=[{"type": doc_type}]
+            )
+            self.logger.debug("  🧠 Embedding guardado para %s", rel_id)
+        except Exception as e:
+            self.logger.error("Fallo al guardar embedding de %s: %s", rel_id, e)
+
+    async def find_related_concepts(self, file_path: Path, content: str, top_k: int = 3) -> list[str]:
+        rel_id = str(file_path.relative_to(self.config.vault))
+        try:
+            emb = await self._get_embedding(content)
+            results = await asyncio.to_thread(
+                self.collection.query,
+                query_embeddings=[emb],
+                n_results=top_k + 1,
+                where={"type": "concept"}
+            )
+            
+            related = []
+            if results and results["ids"]:
+                for match_id in results["ids"][0]:
+                    if match_id != rel_id and len(related) < top_k:
+                        target = match_id.replace(".md", "")
+                        name = target.split("/")[-1].replace("-", " ").title()
+                        related.append(f"[[{target}|{name}]]")
+            return related
+        except Exception as e:
+            self.logger.error("Fallo al buscar conceptos relacionados para %s: %s", rel_id, e)
+            return []
+
+# ---------------------------------------------------------------------------
 # Ingestion Pipeline
 # ---------------------------------------------------------------------------
 class IngestionPipeline:
@@ -594,6 +677,7 @@ class IngestionPipeline:
         writer:    WikiWriter,
         logger:    logging.Logger,
         auto_linker: AutoLinker = None,
+        vector_store: VectorStore = None,
     ) -> None:
         self.config    = config
         self.db        = db
@@ -601,6 +685,7 @@ class IngestionPipeline:
         self.writer    = writer
         self.logger    = logger
         self.auto_linker = auto_linker
+        self.vector_store = vector_store
 
     async def process(self, file_path: Path) -> None:
         rel = str(file_path.relative_to(self.config.vault))
@@ -634,7 +719,32 @@ class IngestionPipeline:
         written = await asyncio.to_thread(self.writer.write, entries)
         self.logger.info("  ✅ Generated %d wiki file(s) from: %s", len(written), rel)
 
-        await asyncio.to_thread(self.db.upsert, rel, current_hash, status="ok")
+        # Trigger Vector Store embeddings
+        if self.config.vector_search_enabled and self.vector_store:
+            for w in written:
+                try:
+                    content_str = await asyncio.to_thread(w.read_text, encoding="utf-8")
+                    doc_type = "source"
+                    if "concepts" in str(w):
+                        doc_type = "concept"
+                    elif "entities" in str(w):
+                        doc_type = "entity"
+                        
+                    await self.vector_store.upsert_file(w, content_str, doc_type)
+                    
+                    if doc_type == "concept":
+                        related = await self.vector_store.find_related_concepts(w, content_str)
+                        if related:
+                            append_str = "\n\n### 🧠 Conceptos Relacionados Semánticamente\n" + "\n".join(f"- {r}" for r in related) + "\n"
+                            with open(w, "a", encoding="utf-8") as f:
+                                f.write(append_str)
+                            # Let it re-hash the appended file
+                except Exception as e:
+                    self.logger.error("Error en pipeline vectorial para %s: %s", w, e)
+
+        # Hash must be updated after the potential file modification from vector search
+        final_hash = await asyncio.to_thread(sha256_of_file, file_path)
+        await asyncio.to_thread(self.db.upsert, rel, final_hash, status="ok")
         
         # Trigger Auto-Linker asynchronously if enabled and concepts/entities were created
         if self.auto_linker:
@@ -790,7 +900,8 @@ async def async_main(args: argparse.Namespace, vault_path: Path) -> None:
     generator = WikiGenerator(config, logger)
     writer    = WikiWriter(config, logger)
     auto_linker = AutoLinker(config, db, logger)
-    pipeline  = IngestionPipeline(config, db, generator, writer, logger, auto_linker)
+    vector_store = VectorStore(config, generator._client, logger) if config.vector_search_enabled else None
+    pipeline  = IngestionPipeline(config, db, generator, writer, logger, auto_linker, vector_store)
 
     loop = asyncio.get_running_loop()
     handler = MarkdownEventHandler(config, pipeline, logger, loop)

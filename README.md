@@ -8,9 +8,9 @@
 [![Built with: Gemini](https://img.shields.io/badge/Built%20with-Google%20Gemini-8E75B2.svg)](https://deepmind.google/technologies/gemini/)
 [![Companion: Obsidian](https://img.shields.io/badge/Obsidian-Plugin%20Companion-7C3AED.svg)](https://obsidian.md/)
 
-An autonomous, lightweight background daemon that automatically generates structured wiki entries (`wiki/concepts/`, `wiki/entities/`, `wiki/sources/`) in your Obsidian vault using the [Karpathy LLM Wiki](https://github.com/GD4AI/obsidian-llm-wiki) methodology and Google Gemini.
+An autonomous, high-performance background daemon that automatically generates structured wiki entries (`wiki/concepts/`, `wiki/entities/`, `wiki/sources/`) in your Obsidian vault using the [Karpathy LLM Wiki](https://github.com/GD4AI/obsidian-llm-wiki) methodology and Google Gemini.
 
-It runs continuously 24/7 in the background (via Docker or Systemd), detecting note creation and edits in real time without requiring the Obsidian desktop app to remain open.
+It runs continuously 24/7 in the background (via Docker or Systemd), detecting note creation and edits in real time with zero dependency on keeping the Obsidian desktop application open.
 
 ---
 
@@ -20,10 +20,12 @@ While the official [obsidian-llm-wiki](https://github.com/GD4AI/obsidian-llm-wik
 
 This companion daemon provides:
 1. **Headless 24/7 Execution:** Runs as an isolated Docker container or Systemd service on your desktop, home server, NAS, or Raspberry Pi.
-2. **100% Free-Tier Friendly:** Specifically engineered to operate reliably within the Google Gemini Free Tier (500 requests/day, 15 RPM) using smart throttling (`REQUEST_INTERVAL=120s`) and dynamic exponential backoff on API rate limits.
-3. **Idempotent Incremental Ingestion:** Maintains an SQLite state database (`ingestion_state.db`) tracking SHA-256 hashes for every note. Notes are only processed when modified; unchanged notes cost 0 tokens.
-4. **Resilient JSON & Error Recovery:** Includes a self-repairing JSON parser that tolerates LaTeX formulas (`\alpha`, `\int`, `\$`), regex escapes, and unescaped quotes returned by LLMs. Automatically retries transient network errors and server overloads (503/500).
-5. **Zero Vault Clutter:** Does not alter your source notes; only writes generated summaries and concepts to your `wiki/` directory.
+2. **Asynchronous & Concurrent Architecture:** Powered by `asyncio` and `AsyncOpenAI`. Includes concurrent initial scans bounded by semaphores and SQLite in WAL mode (`PRAGMA journal_mode=WAL`) for high throughput without database locks.
+3. **Native Structured Outputs (Pydantic):** Uses Gemini / OpenAI native `parse` endpoints with strict Pydantic schemas. Eliminates JSON parsing errors, unescaped quotes, or LaTeX formula corruption (`\alpha`, `\int`, `\$`) at the model generation level.
+4. **🔗 Reverse Auto-Linker (Magic Links):** When new concepts or entities are discovered, an asynchronous background pass scans existing vault notes and automatically injects bidirectional `[[wiki]]` links without creating infinite re-ingestion loops.
+5. **100% Free-Tier Friendly:** Specifically engineered to operate reliably within Google Gemini Free Tier quotas (500 requests/day, 15 RPM) using smart proactive throttling (`REQUEST_INTERVAL=120s`) and dynamic exponential backoff.
+6. **Idempotent Incremental Ingestion:** Maintains an SQLite state database (`ingestion_state.db`) tracking SHA-256 hashes for every note. Notes are only processed when their content changes; unchanged notes cost 0 tokens.
+7. **Cross-Platform Docker Reliability:** Auto-detects runtime environment and falls back to `PollingObserver` on macOS/Windows Docker mounts where native `inotify` events do not propagate.
 
 ---
 
@@ -32,19 +34,20 @@ This companion daemon provides:
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ 1. OBSIDIAN VAULT & COMMUNITY PLUGIN (GD4AI/obsidian-llm-wiki)              │
-│    - Markdown notes in vault folder.                                        │
+│    - Markdown notes in vault folders.                                       │
 │    - Configuration in .obsidian/plugins/karpathywiki/data.json.             │
 │    - Desktop UI: Graph View, interactive chat RAG, and wiki link linting.   │
 └──────────────────────────────────────┬──────────────────────────────────────┘
                                        │ Watches note changes / Writes wiki/
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ 2. AUTONOMOUS INGESTION DAEMON (This service — Docker or Systemd)           │
-│    - Headless Python service (ingest_daemon.py) monitoring via inotify.     │
-│    - Configurable debounce (20s) to wait until you finish writing.          │
-│    - Gemini API inference with strict JSON schema and escape auto-repair.   │
-│    - Persistent state tracking in SQLite (ingestion_state.db).              │
-│    - Throttling & rate limit protection (120s between calls).               │
+│ 2. AUTONOMOUS ASYNC INGESTION DAEMON (This service — Docker or Systemd)     │
+│    - Non-blocking Python service (ingest_daemon.py) running on asyncio.     │
+│    - Watchdog bridge (inotify / PollingObserver) with debouncing (20s).     │
+│    - Gemini inference via native Pydantic Structured Outputs.               │
+│    - Background Auto-Linker: regex pass to interconnect vault notes.        │
+│    - Persistent state tracking in SQLite WAL mode (ingestion_state.db).     │
+│    - Proactive throttling & rate limit protection (120s between calls).     │
 └──────────────────────────────────────┬──────────────────────────────────────┘
                                        │ Telemetry & Read-only sync
                                        ▼
@@ -89,6 +92,9 @@ REQUEST_INTERVAL=120
 
 # Optional: scan old notes and inject wiki links when new concepts/entities are found.
 # ENABLE_AUTO_LINK=true
+
+# Optional: Generate embeddings for semantic search and append related concepts.
+# ENABLE_VECTOR_SEARCH=true
 ```
 
 ### 3. Build and launch
@@ -111,19 +117,67 @@ tail -f /path/to/your/vault/karpathy_ingest.log
 
 | Variable | Required | Default | Description |
 |---|:---:|:---:|---|
-| `GEMINI_API_KEY` | **Yes** | — | Google Gemini API key from Google AI Studio. |
+| `GEMINI_API_KEY` | **Yes** | — | Google Gemini API key from [Google AI Studio](https://aistudio.google.com/app/apikey). |
 | `VAULT_PATH` | **Yes** | `/vault` | Absolute path to the Obsidian vault on the host machine. |
 | `REQUEST_INTERVAL` | No | `120` | Minimum seconds between consecutive API calls. Recommended: `120` (Free tier) or `6` (Paid tier). |
 | `WATCHED_FOLDERS` | No | *from plugin* | Comma-separated list of folders to watch within the vault. If unset, automatically reads `watchedFolders` from `.obsidian/plugins/karpathywiki/data.json`, or monitors the whole vault. |
 | `ENABLE_AUTO_LINK` | No | `false` | Scans old notes and injects `[[wiki]]` links magically when new concepts/entities are generated. |
+| `ENABLE_VECTOR_SEARCH` | No | `false` | Generates local embeddings via Gemini `text-embedding-004` and stores them in ChromaDB. Automatically appends "Semantically Related Concepts" to new concepts. |
 
 ---
 
-## 🖥️ Alternative: Running with Systemd (No Docker)
+## 🔗 Auto-Linker (Reverse Magic Linking)
 
-If you prefer running natively on a Linux machine or Raspberry Pi:
+One of the biggest friction points in Personal Knowledge Management (PKM) is that extracting new concepts does not automatically link older notes that already mentioned them. 
 
-1. **Install Python dependencies in a virtual environment:**
+The daemon features an integrated **AutoLinker** that solves this:
+
+1. **Triggered on Knowledge Extraction:** Whenever the daemon writes new concept notes (`wiki/concepts/`) or entity notes (`wiki/entities/`), an asynchronous background task is scheduled.
+2. **Markdown-Safe Regular Expressions:** Uses negative lookarounds `(?<!\[\[)(?<!\[)\b(term)\b(?!\]\])(?!\])(?!\))` and code block splitting (```) to ensure:
+   - Existing wiki links (`[[...]]`) are never double-wrapped.
+   - Standard markdown links and URLs (`[title](url)`) remain untouched.
+   - Code blocks and inline code snippets are completely ignored.
+   - Short terms (≤ 3 characters) are excluded to prevent false positives.
+3. **Infinite Loop Prevention:** Modifying an old note updates its SHA-256 hash in SQLite (`ingestion_state.db`) immediately. This ensures that the newly modified note is marked as `ok` and will **not** trigger an endless ingestion loop.
+4. **Non-Blocking Background Execution:** The pass runs in a separate asyncio task, so file monitoring and note ingestion proceed without interruption.
+
+---
+
+## ⚙️ How Ingestion Works
+
+```
+Your note in Obsidian
+       │
+       ▼ (Watchdog inotify / PollingObserver detects file change)
+  Debounce (20s — waits until you finish typing)
+       │
+       ▼ (SHA-256 Hash check against ingestion_state.db)
+  Hash matches & status is OK? ──► Ignored (0 tokens, 0 cost)
+  New note or modified?
+       │
+       ▼ (Throttling check — enforces REQUEST_INTERVAL)
+  Calls Google Gemini API (Pydantic Structured Outputs)
+       │
+       ├─────────────────────────────────────────────┐
+       ▼                                             ▼
+  wiki/sources/   ← Note summary & metadata     [If ENABLE_AUTO_LINK=true]
+  wiki/concepts/  ← Concepts, definitions & links   Auto-Linker runs in background:
+  wiki/entities/  ← People, organizations & authors  Scans old notes & injects [[links]]
+                                                    Updates SHA-256 in SQLite (no loops)
+```
+
+### Safety & Vault Integrity
+- **Default Mode (`ENABLE_AUTO_LINK=false`):** Purely read-only on your source notes. The daemon only creates files under `wiki/` and updates the SQLite database. It never deletes or alters your original notes.
+- **Auto-Linker Mode (`ENABLE_AUTO_LINK=true`):** Safely injects wiki links (`[[wiki/...|Term]]`) into existing notes, while preserving code snippets and URLs, and tracking hashes to ensure absolute idempotence.
+- **Ignored Directories:** Automatically skips `wiki/`, `.obsidian/`, `.git/`, and `.trash/`.
+
+---
+
+## 🖥️ Alternative: Running with Systemd (Native Linux)
+
+If you prefer running natively on Ubuntu, Debian, or Raspberry Pi without Docker:
+
+1. **Install dependencies in a virtual environment:**
    ```bash
    python3 -m venv venv
    ./venv/bin/pip install -r requirements.txt
@@ -139,37 +193,11 @@ If you prefer running natively on a Linux machine or Raspberry Pi:
    sudo systemctl enable --now karpathy-wiki-ingest@$USER
    ```
 
-4. **Check status:**
+4. **Check status & live logs:**
    ```bash
    systemctl status karpathy-wiki-ingest@$USER
    journalctl -u karpathy-wiki-ingest@$USER -f
    ```
-
----
-
-## ⚙️ How Ingestion Works
-
-```
-Your note in Obsidian
-       │
-       ▼ (Watchdog inotify detects file change)
-  Debounce (20s — waits until you finish typing)
-       │
-       ▼ (SHA-256 Hash check against ingestion_state.db)
-  Hash matches & status is OK? ──► Ignored (0 tokens, 0 cost)
-  New note or modified?
-       │
-       ▼ (Throttling check — enforces REQUEST_INTERVAL)
-  Calls Google Gemini API (Structured JSON)
-       │
-       ▼
-  wiki/sources/   ← Note summary & metadata
-  wiki/concepts/  ← Core concepts, definitions & interlinks
-  wiki/entities/  ← People, organizations, authors mentioned
-```
-
-- **Safety:** The daemon **only reads** source notes. It **never deletes or modifies** your original files. It only writes generated files under `wiki/` and updates the SQLite state database.
-- **Ignored Directories:** Automatically ignores `wiki/`, `.obsidian/`, `.git/`, and `.trash/`.
 
 ---
 
@@ -187,18 +215,44 @@ Your note in Obsidian
 
 ---
 
+## 🔍 Log Output Example
+
+```text
+🚀 KarpathyWiki Ingest Daemon (Async) started
+   Vault    : /vault
+   Model    : gemini-2.5-flash-lite
+   Debounce : 20s
+   Throttle : 120s between API calls
+   Watching : 02 Permanent Notes/, Clippings/
+   Log file : /vault/karpathy_ingest.log
+============================================================
+🔍 Running initial vault scan…
+🔍 Found 2 modified/new note(s). Processing concurrently...
+📝 Processing note: 02 Permanent Notes/Active Inference.md
+⏳ Rate limiter: waiting 118.3s before next API call…
+  ✅ Written: wiki/sources/active-inference_4f2a.md
+  ✅ Written: wiki/concepts/markov-blanket.md
+  ✅ Written: wiki/concepts/free-energy-principle.md
+  ✅ Generated 3 wiki file(s) from: 02 Permanent Notes/Active Inference.md
+🔗 Auto-Linker: Iniciando escaneo de enlaces mágicos en la bóveda...
+  🔗 Auto-Linker: 2 enlaces inyectados en 01 Fleeting Notes/Reading List.md
+🔗 Auto-Linker: Pass completado. 2 enlaces inyectados en 1 notas.
+```
+
+---
+
 ## 🤝 Relationship to the Obsidian Community Plugin
 
-This project is a standalone, companion tool designed to work alongside the [Karpathy LLM Wiki Obsidian Plugin](https://github.com/GD4AI/obsidian-llm-wiki) created by `GD4AI` / `green-dalii`. Both tools operate on the same folder conventions (`wiki/concepts/`, `wiki/entities/`, `wiki/sources/`), allowing you to use Obsidian for querying and graph visualization while this daemon handles continuous background ingestion.
+This project is an autonomous companion tool designed to work alongside the [Karpathy LLM Wiki Obsidian Plugin](https://github.com/GD4AI/obsidian-llm-wiki) created by `GD4AI` / `green-dalii`. Both tools adhere to the exact same folder structure (`wiki/concepts/`, `wiki/entities/`, `wiki/sources/`), allowing you to use Obsidian for visual graph exploration and RAG chat while this headless daemon handles continuous background ingestion.
 
 ---
 
 ## 🤖 AI Attribution & Disclaimer
 
-This project was developed with the assistance of **Google Gemini** (via pair-programming with Gemini 3.8 Flash). The architecture design, code implementation of `ingest_daemon.py`, Docker configuration, error-handling mechanisms, and documentation were generated by the AI model under human requirements, supervision, and live vault testing.
+This project was developed with the assistance of **Google Gemini** (via pair-programming with Gemini 3.8 Flash). The architecture design, code implementation of `ingest_daemon.py`, Docker configuration, error-handling mechanisms, and documentation were created under human requirements, supervision, and live vault testing.
 
-- **Human Contribution:** Conceptual design, architecture requirements, debugging live vault ingestion bottlenecks, test validation, and prompt direction.
-- **AI Contribution:** Code generation, resilient JSON parsing logic, retry handlers, systemd template, and bilingual documentation.
+- **Human Contribution:** Conceptual design, architectural specifications, debugging live vault ingestion bottlenecks, test validation, and prompt direction.
+- **AI Contribution:** Code generation, asyncio refactoring, Pydantic structured output integration, auto-linker regex engine, systemd template, and bilingual documentation.
 
 *Disclaimer:* While tested extensively on live vaults, always maintain backups of your Obsidian vault before deploying any automated ingestion tooling.
 
