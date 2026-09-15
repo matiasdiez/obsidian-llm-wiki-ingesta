@@ -86,6 +86,9 @@ REQUEST_INTERVAL=120
 # Optional: folders to monitor (comma-separated).
 # If left empty, it reads watchedFolders from data.json or watches the entire vault.
 # WATCHED_FOLDERS=Notes,Journal,Articles
+
+# Optional: scan old notes and inject wiki links when new concepts/entities are found.
+# ENABLE_AUTO_LINK=true
 ```
 
 ### 3. Build and launch
@@ -112,6 +115,7 @@ tail -f /path/to/your/vault/karpathy_ingest.log
 | `VAULT_PATH` | **Yes** | `/vault` | Absolute path to the Obsidian vault on the host machine. |
 | `REQUEST_INTERVAL` | No | `120` | Minimum seconds between consecutive API calls. Recommended: `120` (Free tier) or `6` (Paid tier). |
 | `WATCHED_FOLDERS` | No | *from plugin* | Comma-separated list of folders to watch within the vault. If unset, automatically reads `watchedFolders` from `.obsidian/plugins/karpathywiki/data.json`, or monitors the whole vault. |
+| `ENABLE_AUTO_LINK` | No | `false` | Scans old notes and injects `[[wiki]]` links magically when new concepts/entities are generated. |
 
 ---
 

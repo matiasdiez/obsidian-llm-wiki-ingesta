@@ -57,6 +57,7 @@ GEMINI_API_KEY=tu_api_key_de_google_ai_studio
 VAULT_PATH=/ruta/absoluta/a/tu/vault/de/obsidian
 REQUEST_INTERVAL=120
 # WATCHED_FOLDERS=Notes,Journal,Articles
+# ENABLE_AUTO_LINK=true
 ```
 
 | Variable | Requerido | Valor recomendado / Descripción |
@@ -65,6 +66,7 @@ REQUEST_INTERVAL=120
 | `VAULT_PATH` | **Sí** | Ruta absoluta al vault de Obsidian en el host. |
 | `REQUEST_INTERVAL` | No | Segundos entre llamadas a la API: `120` (Free tier) · `6` (Paid tier). |
 | `WATCHED_FOLDERS` | No | Lista de carpetas a monitorear separadas por coma. Si se omite, lee `watchedFolders` del plugin en `data.json`, o monitorea todo el vault. |
+| `ENABLE_AUTO_LINK` | No | Activa la inyección automática de enlaces mágicos `[[wiki]]` en notas antiguas cuando se extraen nuevos conceptos. (`true`/`false`) |
 
 > ⚠️ El `.env` contiene tu API key y rutas locales. Está en `.gitignore` para no subirse a git. Usa `.env.example` como plantilla.
 
