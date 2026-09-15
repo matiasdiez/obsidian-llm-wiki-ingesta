@@ -26,6 +26,8 @@ This companion daemon provides:
 5. **100% Free-Tier Friendly:** Specifically engineered to operate reliably within Google Gemini Free Tier quotas (500 requests/day, 15 RPM) using smart proactive throttling (`REQUEST_INTERVAL=120s`) and dynamic exponential backoff.
 6. **Idempotent Incremental Ingestion:** Maintains an SQLite state database (`ingestion_state.db`) tracking SHA-256 hashes for every note. Notes are only processed when their content changes; unchanged notes cost 0 tokens.
 7. **Cross-Platform Docker Reliability:** Auto-detects runtime environment and falls back to `PollingObserver` on macOS/Windows Docker mounts where native `inotify` events do not propagate.
+8. **🧠 Local Vector Embeddings (Semantic Search):** Powered by ChromaDB and Google's `text-embedding-004`. Embeds and indexes your generated wiki notes locally, discovering non-obvious conceptual links and automatically injecting semantically related concepts.
+9. **🏠 Plug-and-Play Local Models (Ollama / LM Studio):** Run 100% offline without API keys or costs. Seamlessly points to any OpenAI-compatible local server (`OPENAI_BASE_URL`), auto-injects dummy API keys for localhost, and features a transparent fallback from JSON Schema to standard `json_object` + Pydantic validation if the local engine does not support `beta.chat.completions.parse`.
 
 ---
 
@@ -95,6 +97,11 @@ REQUEST_INTERVAL=120
 
 # Optional: Generate embeddings for semantic search and append related concepts.
 # ENABLE_VECTOR_SEARCH=true
+
+# Optional: Local / Offline Models (Ollama, LMStudio, vLLM, etc.)
+# OPENAI_BASE_URL=http://localhost:11434/v1
+# MODEL_NAME=llama3.1:8b
+# EMBEDDING_MODEL_NAME=nomic-embed-text
 ```
 
 ### 3. Build and launch
@@ -122,7 +129,10 @@ tail -f /path/to/your/vault/karpathy_ingest.log
 | `REQUEST_INTERVAL` | No | `120` | Minimum seconds between consecutive API calls. Recommended: `120` (Free tier) or `6` (Paid tier). |
 | `WATCHED_FOLDERS` | No | *from plugin* | Comma-separated list of folders to watch within the vault. If unset, automatically reads `watchedFolders` from `.obsidian/plugins/karpathywiki/data.json`, or monitors the whole vault. |
 | `ENABLE_AUTO_LINK` | No | `false` | Scans old notes and injects `[[wiki]]` links magically when new concepts/entities are generated. |
-| `ENABLE_VECTOR_SEARCH` | No | `false` | Generates local embeddings via Gemini `text-embedding-004` and stores them in ChromaDB. Automatically appends "Semantically Related Concepts" to new concepts. |
+| `ENABLE_VECTOR_SEARCH` | No | `false` | Generates local embeddings via Gemini `text-embedding-004` (or local embedding model) and stores them in ChromaDB. Automatically appends "Semantically Related Concepts" to new concepts. |
+| `OPENAI_BASE_URL` | No | *Gemini API* | Custom base URL for OpenAI-compatible local endpoints (e.g., `http://localhost:11434/v1` for Ollama, `http://localhost:1234/v1` for LM Studio). Also accepts `LOCAL_API_BASE_URL`. When pointing to `localhost` or `127.0.0.1`, `GEMINI_API_KEY` is not required. |
+| `MODEL_NAME` | No | `gemini-2.5-flash-lite` | Override LLM model name (e.g., `llama3.1:8b`, `qwen2.5:7b`, `mistral:7b`). |
+| `EMBEDDING_MODEL_NAME` | No | `text-embedding-004` | Override embedding model name for vector search (e.g., `nomic-embed-text`, `bge-m3`, `all-minilm`). |
 
 ---
 
@@ -140,6 +150,74 @@ The daemon features an integrated **AutoLinker** that solves this:
    - Short terms (≤ 3 characters) are excluded to prevent false positives.
 3. **Infinite Loop Prevention:** Modifying an old note updates its SHA-256 hash in SQLite (`ingestion_state.db`) immediately. This ensures that the newly modified note is marked as `ok` and will **not** trigger an endless ingestion loop.
 4. **Non-Blocking Background Execution:** The pass runs in a separate asyncio task, so file monitoring and note ingestion proceed without interruption.
+
+---
+
+## 🧠 Local Embeddings for Semantic Search (Vector Search)
+
+In addition to literal keyword matching, the daemon integrates a high-performance local vector database powered by **ChromaDB** and Google's **`text-embedding-004`** model:
+
+### 1. How It Works
+- **100% Local Persistence:** Embeddings and indices are stored locally inside your vault at `.obsidian/plugins/karpathywiki/chroma_db` (using HNSW with cosine distance). No external vector cloud, API subscriptions, or SaaS required.
+- **Universal Knowledge Indexing:** Every generated markdown entry (`wiki/sources/`, `wiki/concepts/`, `wiki/entities/`) is embedded and stored with its respective metadata (`{"type": "concept" | "source" | "entity"}`).
+- **Automatic Conceptual Bridges:** When a new concept note is created or updated, the daemon automatically queries ChromaDB for the top-3 most semantically similar concepts (`top_k=3`) and appends a dedicated section at the bottom of the file:
+  ```markdown
+  ### 🧠 Conceptos Relacionados Semánticamente
+  - [[wiki/concepts/free-energy-principle|Free Energy Principle]]
+  - [[wiki/concepts/predictive-coding|Predictive Coding]]
+  - [[wiki/concepts/bayesian-brain|Bayesian Brain]]
+  ```
+- **State Integrity & Anti-Loop:** Because the concept file is modified to include related concepts, the daemon immediately recalculates the final SHA-256 hash and updates `ingestion_state.db`, ensuring that this automated enrichment never triggers an ingestion loop.
+- **Resilient Embedding Retries:** Features automatic exponential backoff retries (up to 3 attempts) for the `text-embedding-004` endpoint to guarantee robust indexation.
+
+### 2. Enabling Vector Search
+Add the following variable to your `.env`:
+```ini
+ENABLE_VECTOR_SEARCH=true
+```
+*(Requires `chromadb>=0.4.0` in `requirements.txt`).*
+
+---
+
+## 🏠 Offline & Local Models (Ollama, LM Studio, vLLM)
+
+You can run the ingestion daemon completely offline without relying on Google Gemini or any cloud provider. The daemon natively interfaces with any local server exposing an OpenAI-compatible API.
+
+### 1. Quick Setup with Ollama
+Pull your preferred LLM and embedding models:
+```bash
+ollama pull llama3.1:8b
+ollama pull nomic-embed-text
+```
+
+### 2. Configuration in `.env`
+Set the local endpoint and model names in `.env`:
+```ini
+# Local OpenAI-compatible endpoint
+OPENAI_BASE_URL=http://localhost:11434/v1
+
+# Models
+MODEL_NAME=llama3.1:8b
+EMBEDDING_MODEL_NAME=nomic-embed-text
+
+# No rate limiting needed for local inference
+REQUEST_INTERVAL=0
+
+# Enable local vector search with ChromaDB
+ENABLE_VECTOR_SEARCH=true
+```
+
+> [!TIP]
+> **No API Key Required:** When `OPENAI_BASE_URL` contains `localhost` or `127.0.0.1`, the daemon automatically injects a dummy API key (`local-dummy-key`). You do not need to set `GEMINI_API_KEY`.
+
+### 3. Transparent JSON Fallback & Pydantic Validation
+While official OpenAI/Gemini endpoints support `beta.chat.completions.parse` (strict JSON schema), many local inference servers (Ollama, LM Studio, vLLM) do not yet implement this specific beta grammar and return a `400 Bad Request`.
+
+The daemon handles this automatically:
+1. It attempts `beta.chat.completions.parse` first.
+2. If the local server throws a `BadRequestError`, it seamlessly falls back to standard `chat.completions.create` with `response_format={"type": "json_object"}` and appends strict schema instructions to the prompt.
+3. Automatically strips any markdown fences (````json ... ````) returned by local LLMs.
+4. Validates the resulting JSON payload through `WikiResponse.model_validate_json(...)` to guarantee full schema integrity before writing to your vault.
 
 ---
 
@@ -163,7 +241,12 @@ Your note in Obsidian
   wiki/sources/   ← Note summary & metadata     [If ENABLE_AUTO_LINK=true]
   wiki/concepts/  ← Concepts, definitions & links   Auto-Linker runs in background:
   wiki/entities/  ← People, organizations & authors  Scans old notes & injects [[links]]
-                                                    Updates SHA-256 in SQLite (no loops)
+       │                                             Updates SHA-256 in SQLite (no loops)
+       ▼ [If ENABLE_VECTOR_SEARCH=true]
+  ChromaDB Vector Store:
+  - Generates embeddings with text-embedding-004
+  - Injects "Semantically Related Concepts" into concept notes
+  - Updates note SHA-256 hash in SQLite
 ```
 
 ### Safety & Vault Integrity

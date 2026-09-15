@@ -43,7 +43,7 @@ except ImportError:
     sys.exit("❌  Missing dependency: run  pip install python-dotenv")
 
 try:
-    from openai import AsyncOpenAI, RateLimitError, APIStatusError, APIConnectionError
+    from openai import AsyncOpenAI, RateLimitError, APIStatusError, APIConnectionError, BadRequestError
     from pydantic import BaseModel, Field
 except ImportError:
     sys.exit("❌  Missing dependency: run  pip install openai pydantic")
@@ -118,11 +118,21 @@ class Config:
 
     @property
     def base_url(self) -> str:
-        return self._raw.get("baseUrl", "https://generativelanguage.googleapis.com/v1beta/openai")
+        env_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("LOCAL_API_BASE_URL")
+        if env_url:
+            return env_url
+        return self._raw.get("baseUrl", "https://generativelanguage.googleapis.com/v1beta/openai/")
 
     @property
     def model(self) -> str:
+        env_model = os.environ.get("MODEL_NAME")
+        if env_model:
+            return env_model
         return self._raw.get("model", "gemini-2.5-flash-lite")
+
+    @property
+    def embedding_model(self) -> str:
+        return os.environ.get("EMBEDDING_MODEL_NAME") or "text-embedding-004"
 
     @property
     def wiki_folder(self) -> str:
@@ -146,9 +156,11 @@ class Config:
 
     @property
     def api_key(self) -> str:
-        key = os.environ.get("GEMINI_API_KEY", "")
+        key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
         if not key:
             key = self._raw.get("apiKey", "")
+        if not key and ("localhost" in self.base_url or "127.0.0.1" in self.base_url):
+            return "local-dummy-key"
         if not key:
             raise RuntimeError(
                 "No API key found. Set the GEMINI_API_KEY environment variable "
@@ -351,22 +363,49 @@ class WikiGenerator:
         
         for attempt in range(self.MAX_RETRIES):
             try:
-                # Using the beta parse helper which leverages JSON Schema under the hood
-                response = await self._client.beta.chat.completions.parse(
-                    model=self.config.model,
-                    temperature=0.2,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user",   "content": user_prompt},
-                    ],
-                    response_format=WikiResponse,
-                )
-                
-                # The response is guaranteed to match the Pydantic model
-                if response.choices[0].message.parsed:
-                    return response.choices[0].message.parsed
-                else:
-                    raise RuntimeError("LLM returned an empty parsed response.")
+                try:
+                    # Using the beta parse helper which leverages JSON Schema under the hood
+                    response = await self._client.beta.chat.completions.parse(
+                        model=self.config.model,
+                        temperature=0.2,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user",   "content": user_prompt},
+                        ],
+                        response_format=WikiResponse,
+                    )
+                    
+                    if response.choices[0].message.parsed:
+                        return response.choices[0].message.parsed
+                    else:
+                        raise RuntimeError("LLM returned an empty parsed response.")
+                except BadRequestError as parse_exc:
+                    # Local models (Ollama/LMStudio) might not support the structured beta format.
+                    # Fallback to standard JSON object mode.
+                    self.logger.debug("Structured output beta failed, falling back to JSON mode: %s", parse_exc)
+                    fallback_system_prompt = system_prompt + "\n\nCRITICAL: Return a valid JSON object strictly adhering to the requested schema. No markdown wrapping."
+                    
+                    response = await self._client.chat.completions.create(
+                        model=self.config.model,
+                        temperature=0.2,
+                        messages=[
+                            {"role": "system", "content": fallback_system_prompt},
+                            {"role": "user",   "content": user_prompt},
+                        ],
+                        response_format={"type": "json_object"}
+                    )
+                    
+                    content = response.choices[0].message.content
+                    if not content:
+                        raise RuntimeError("LLM returned empty content.")
+                        
+                    # Clean markdown code block if present
+                    if content.startswith("```json"):
+                        content = content[7:-3]
+                    elif content.startswith("```"):
+                        content = content[3:-3]
+                        
+                    return WikiResponse.model_validate_json(content.strip())
 
             except (RateLimitError, APIStatusError, APIConnectionError) as exc:
                 is_429 = (isinstance(exc, RateLimitError) or 
@@ -617,7 +656,7 @@ class VectorStore:
             try:
                 response = await self.client.embeddings.create(
                     input=[text],
-                    model="text-embedding-004"
+                    model=self.config.embedding_model
                 )
                 return response.data[0].embedding
             except Exception as e:

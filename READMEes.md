@@ -20,6 +20,8 @@ Daemon autónomo y asíncrono en Python que automatiza la generación de notas w
 4. **100% Amigable con el Free Tier de Gemini:** Throttling proactivo configurable (`REQUEST_INTERVAL=120s`) y backoff exponencial que respetan a rajatabla los límites gratuitos de Google Gemini (15 RPM / 500 peticiones diarias).
 5. **Idempotencia Estricta:** SQLite (`ingestion_state.db`) registra los hashes SHA-256 de cada archivo; si una nota no ha cambiado, el costo en tokens y llamadas es cero.
 6. **Compatibilidad Docker Multiplataforma:** Detección automática con fallback a `PollingObserver` para contenedores sobre macOS y Windows donde `inotify` no se propaga a través de volúmenes compartidos.
+7. **🧠 Embeddings Locales y Búsqueda Vectorial:** Integración con ChromaDB y Google `text-embedding-004`. Indexa la base de conocimiento localmente en disco y enlaza de forma autónoma conceptos semánticamente afines.
+8. **🏠 Soporte Plug-and-Play para Modelos Locales (Ollama / LM Studio):** Ejecución 100% offline y gratuita sin depender de APIs en la nube. Incluye fallback automático si el servidor local no soporta `beta.chat.completions.parse`, retrocediendo a `json_object` y validando con Pydantic. Inyección automática de API key ficticia para `localhost`.
 
 ---
 
@@ -43,7 +45,12 @@ Tu nota en Obsidian
   wiki/sources/   ← resumen de la nota          [Si ENABLE_AUTO_LINK=true]
   wiki/concepts/  ← conceptos y definiciones        Auto-Linker en segundo plano:
   wiki/entities/  ← personas y organizaciones       Escanea notas viejas e inyecta [[links]]
-                                                    Actualiza hash en SQLite (sin bucles)
+       │                                            Actualiza hash en SQLite (sin bucles)
+       ▼ [Si ENABLE_VECTOR_SEARCH=true]
+  Almacén Vectorial ChromaDB:
+  - Genera embeddings con text-embedding-004
+  - Inyecta "Conceptos Relacionados Semánticamente" en la nota
+  - Actualiza el hash final de la nota en SQLite
 ```
 
 **Lee la configuración** del plugin desde `.obsidian/plugins/karpathywiki/data.json` (carpetas monitoreadas, modelo, idioma). Si no encuentra el archivo, puede definirse en `.env` o monitorear todo el vault.
@@ -75,6 +82,11 @@ REQUEST_INTERVAL=120
 # WATCHED_FOLDERS=Notes,Journal,Articles
 # ENABLE_AUTO_LINK=true
 # ENABLE_VECTOR_SEARCH=true
+
+# Opcional: Modelos Locales Offline (Ollama, LMStudio, vLLM, etc.)
+# OPENAI_BASE_URL=http://localhost:11434/v1
+# MODEL_NAME=llama3.1:8b
+# EMBEDDING_MODEL_NAME=nomic-embed-text
 ```
 
 | Variable | Requerido | Valor recomendado / Descripción |
@@ -84,7 +96,10 @@ REQUEST_INTERVAL=120
 | `REQUEST_INTERVAL` | No | Segundos entre llamadas a la API: `120` (Free tier) · `6` (Paid tier). |
 | `WATCHED_FOLDERS` | No | Lista de carpetas a monitorear separadas por coma. Si se omite, lee `watchedFolders` del plugin en `data.json`, o monitorea todo el vault. |
 | `ENABLE_AUTO_LINK` | No | Activa la inyección automática de enlaces mágicos `[[wiki]]` en notas antiguas cuando se extraen nuevos conceptos. (`true`/`false`) |
-| `ENABLE_VECTOR_SEARCH` | No | Genera embeddings (`text-embedding-004`) en ChromaDB y añade "Conceptos Relacionados Semánticamente" al final de cada concepto nuevo. (`true`/`false`) |
+| `ENABLE_VECTOR_SEARCH` | No | Genera embeddings (`text-embedding-004` o modelo local) en ChromaDB y añade "Conceptos Relacionados Semánticamente" al final de cada concepto nuevo. (`true`/`false`) |
+| `OPENAI_BASE_URL` | No | URL base personalizada para servidores locales compatibles con OpenAI (ej. `http://localhost:11434/v1` para Ollama, `http://localhost:1234/v1` para LM Studio). También acepta `LOCAL_API_BASE_URL`. Si apunta a `localhost` o `127.0.0.1`, no requiere `GEMINI_API_KEY`. |
+| `MODEL_NAME` | No | Sobrescribe el nombre del modelo LLM (ej. `llama3.1:8b`, `qwen2.5:7b`, `mistral:7b`). Por defecto: `gemini-2.5-flash-lite`. |
+| `EMBEDDING_MODEL_NAME` | No | Sobrescribe el nombre del modelo de embeddings para búsqueda vectorial (ej. `nomic-embed-text`, `bge-m3`). Por defecto: `text-embedding-004`. |
 
 > ⚠️ El `.env` contiene tu API key y rutas locales. Está en `.gitignore` para no subirse a git. Usa `.env.example` como plantilla.
 
@@ -247,13 +262,71 @@ El daemon integra un motor de **AutoLinker** inverso que resuelve esto de forma 
 
 ---
 
-## 🧠 Búsqueda Semántica y Vector Store (Opcional)
+## 🧠 Embeddings Locales para Búsqueda Semántica (Vector Search)
 
-El daemon incluye una capa opcional de base de datos vectorial impulsada por **ChromaDB**:
+Además de la vinculación explícita por nombres y entidades, el daemon incorpora un subsistema de base de datos vectorial local impulsado por **ChromaDB** y el modelo **`text-embedding-004`** de Google:
 
-- **Activación:** Habilita `ENABLE_VECTOR_SEARCH=true` en `.env` (requiere `pip install chromadb`).
-- **Embeddings:** Genera representaciones vectoriales automáticas con el modelo `text-embedding-004` de Google.
-- **Descubrimiento Semántico:** Almacena los vectores en `.obsidian/plugins/karpathywiki/chroma_db` y vincula automáticamente conceptos conceptualmente afines al pie de cada nota generada en `wiki/concepts/`.
+### 1. ¿Cómo funciona?
+- **Almacenamiento Local Persistente:** Los vectores e índices se almacenan directamente dentro de tu vault en `.obsidian/plugins/karpathywiki/chroma_db` mediante un índice HNSW con métrica de similitud coseno (`cosine`). Es 100% privado, local y sin costos de bases de datos en la nube ni servicios de terceros.
+- **Indexación Integral de Conocimiento:** Cada entrada generada (`wiki/sources/`, `wiki/concepts/`, `wiki/entities/`) se vectoriza y almacena junto a su metadato de clasificación (`{"type": "concept" | "source" | "entity"}`).
+- **Descubrimiento Conceptual Autónomo:** Cuando se genera o actualiza una nota de concepto, el daemon consulta automáticamente en ChromaDB los 3 conceptos conceptualmente más próximos (`top_k=3`) e inyecta al final del archivo una sección con enlaces wiki:
+  ```markdown
+  ### 🧠 Conceptos Relacionados Semánticamente
+  - [[wiki/concepts/principio-de-energia-libre|Principio De Energia Libre]]
+  - [[wiki/concepts/codificacion-predictiva|Codificacion Predictiva]]
+  - [[wiki/concepts/cerebro-bayesiano|Cerebro Bayesiano]]
+  ```
+- **Integridad de Hash e Idempotencia:** Como la nota de concepto se modifica para agregar los enlaces relacionados, el daemon recalcula inmediatamente el hash SHA-256 definitivo y lo actualiza en `ingestion_state.db` con estado `ok`, evitando bucles de reingesta.
+- **Tolerancia y Reintentos:** Cuenta con reintentos automáticos con backoff exponencial (hasta 3 intentos) para la generación de embeddings en caso de microcortes de red.
+
+### 2. Activación
+Añade la siguiente variable a tu `.env`:
+```ini
+ENABLE_VECTOR_SEARCH=true
+```
+*(Requiere `chromadb>=0.4.0` en `requirements.txt`).*
+
+---
+
+## 🏠 Modelos Locales y Offline (Ollama, LM Studio, vLLM)
+
+Es posible ejecutar el daemon de ingesta de forma completamente offline y privada sin enviar datos a Google Gemini ni incurrir en costes de API, aprovechando modelos locales mediante cualquier servidor con interfaz compatible con OpenAI.
+
+### 1. Puesta en marcha rápida con Ollama
+Descarga tus modelos preferidos de LLM y embeddings:
+```bash
+ollama pull llama3.1:8b
+ollama pull nomic-embed-text
+```
+
+### 2. Configuración en `.env`
+Configura el endpoint local y los nombres de los modelos en tu archivo `.env`:
+```ini
+# Endpoint local compatible con OpenAI
+OPENAI_BASE_URL=http://localhost:11434/v1
+
+# Modelos
+MODEL_NAME=llama3.1:8b
+EMBEDDING_MODEL_NAME=nomic-embed-text
+
+# Sin esperas de limitación de tasa para inferencia local
+REQUEST_INTERVAL=0
+
+# Búsqueda vectorial local con ChromaDB
+ENABLE_VECTOR_SEARCH=true
+```
+
+> [!TIP]
+> **Sin API Key Requerida:** Cuando `OPENAI_BASE_URL` contiene `localhost` o `127.0.0.1`, el daemon inyecta de forma automática una clave ficticia (`local-dummy-key`). No necesitas definir `GEMINI_API_KEY`.
+
+### 3. Fallback Transparente de JSON y Validación con Pydantic
+Muchos servidores locales de inferencia (Ollama, LM Studio, vLLM) no implementan la sintaxis específica `beta.chat.completions.parse` de OpenAI y devuelven un error `400 Bad Request`.
+
+El daemon gestiona esto de forma completamente automática y transparente:
+1. Intenta en primer lugar invocar `beta.chat.completions.parse`.
+2. Si el servidor local responde con `BadRequestError`, captura la excepción y retrocede de inmediato a `chat.completions.create` con `response_format={"type": "json_object"}`, inyectando instrucciones estrictas de formato JSON en el prompt.
+3. Limpia automáticamente cualquier bloque de código markdown (````json ... ````) que el modelo local añada.
+4. Valida y deserializa el JSON directamente con `WikiResponse.model_validate_json(...)` de Pydantic antes de escribir cualquier archivo en tu bóveda.
 
 ---
 
