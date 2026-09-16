@@ -20,7 +20,7 @@ Daemon autónomo y asíncrono en Python que automatiza la generación de notas w
 4. **100% Amigable con el Free Tier de Gemini:** Throttling proactivo configurable (`REQUEST_INTERVAL=120s`) y backoff exponencial que respetan a rajatabla los límites gratuitos de Google Gemini (15 RPM / 500 peticiones diarias).
 5. **Idempotencia Estricta:** SQLite (`ingestion_state.db`) registra los hashes SHA-256 de cada archivo; si una nota no ha cambiado, el costo en tokens y llamadas es cero.
 6. **Compatibilidad Docker Multiplataforma:** Detección automática con fallback a `PollingObserver` para contenedores sobre macOS y Windows donde `inotify` no se propaga a través de volúmenes compartidos.
-7. **🧠 Embeddings Locales y Búsqueda Vectorial:** Integración con ChromaDB y Google `text-embedding-004`. Indexa la base de conocimiento localmente en disco y enlaza de forma autónoma conceptos semánticamente afines.
+7. **🧠 Búsqueda Semántica (Vector Embeddings):** Impulsada por `gemini-embedding-001` de Google, con los vectores almacenados en SQLite (sin ChromaDB ni dependencias pesadas). Indexa la base de conocimiento y enlaza de forma autónoma conceptos semánticamente afines.
 8. **🏠 Soporte Plug-and-Play para Modelos Locales (Ollama / LM Studio):** Ejecución 100% offline y gratuita sin depender de APIs en la nube. Incluye fallback automático si el servidor local no soporta `beta.chat.completions.parse`, retrocediendo a `json_object` y validando con Pydantic. Inyección automática de API key ficticia para `localhost`.
 9. **🔔 Notificaciones Nativas de Escritorio:** Recibe notificaciones toast inmediatas y discretas del sistema operativo (vía `plyer`) con un resumen inteligente cada vez que se extraen nuevos conceptos o entidades mientras escribes. Mecanismo resiliente que ignora caídas en entornos sin interfaz gráfica o Docker.
 
@@ -48,8 +48,8 @@ Tu nota en Obsidian
   wiki/entities/  ← personas y organizaciones       Escanea notas viejas e inyecta [[links]]
        │                                            Actualiza hash en SQLite (sin bucles)
        ▼ [Si ENABLE_VECTOR_SEARCH=true]
-  Almacén Vectorial ChromaDB:
-  - Genera embeddings con text-embedding-004
+  Almacén Vectorial (SQLite):
+  - Genera embeddings con gemini-embedding-001
   - Inyecta "Conceptos Relacionados Semánticamente" en la nota
   - Actualiza el hash final de la nota en SQLite
 ```
@@ -65,9 +65,9 @@ Tu nota en Obsidian
 ```
 obsidian-llm-wiki-ingesta/
 ├── ingest_daemon.py       # Script principal del daemon (asyncio)
-├── Dockerfile             # Imagen Python 3.12 Alpine (~80MB)
+├── Dockerfile             # Imagen Python 3.12 slim, build multi-stage
 ├── docker-compose.yml     # Gestión simplificada del contenedor
-├── requirements.txt       # Dependencias Python (watchdog, openai, pydantic, chromadb)
+├── requirements.txt       # Dependencias Python (watchdog, openai, pydantic, numpy)
 ├── .env.example           # Plantilla de variables de entorno
 └── .env                   # Configuración local (NO subir a git)
 ```
@@ -100,11 +100,11 @@ REQUEST_INTERVAL=120
 | `REQUEST_INTERVAL` | No | Segundos entre llamadas a la API: `120` (Free tier) · `6` (Paid tier). |
 | `WATCHED_FOLDERS` | No | Lista de carpetas a monitorear separadas por coma. Si se omite, lee `watchedFolders` del plugin en `data.json`, o monitorea todo el vault. |
 | `ENABLE_AUTO_LINK` | No | Activa la inyección automática de enlaces mágicos `[[wiki]]` en notas antiguas cuando se extraen nuevos conceptos. (`true`/`false`) |
-| `ENABLE_VECTOR_SEARCH` | No | Genera embeddings (`text-embedding-004` o modelo local) en ChromaDB y añade "Conceptos Relacionados Semánticamente" al final de cada concepto nuevo. (`true`/`false`) |
+| `ENABLE_VECTOR_SEARCH` | No | Genera embeddings (`gemini-embedding-001` o modelo local) y los guarda en SQLite; añade "Conceptos Relacionados Semánticamente" al final de cada concepto nuevo. (`true`/`false`) |
 | `ENABLE_NOTIFICATIONS` | No | Envía notificaciones de escritorio del SO cuando se extraen conceptos exitosamente (requiere ejecución local, puede fallar en Docker). (`true`/`false`) |
 | `OPENAI_BASE_URL` | No | URL base personalizada para servidores locales compatibles con OpenAI (ej. `http://localhost:11434/v1` para Ollama, `http://localhost:1234/v1` para LM Studio). También acepta `LOCAL_API_BASE_URL`. Si apunta a `localhost` o `127.0.0.1`, no requiere `GEMINI_API_KEY`. |
 | `MODEL_NAME` | No | Sobrescribe el nombre del modelo LLM (ej. `llama3.1:8b`, `qwen2.5:7b`, `mistral:7b`). Por defecto: `gemini-2.5-flash-lite`. |
-| `EMBEDDING_MODEL_NAME` | No | Sobrescribe el nombre del modelo de embeddings para búsqueda vectorial (ej. `nomic-embed-text`, `bge-m3`). Por defecto: `text-embedding-004`. |
+| `EMBEDDING_MODEL_NAME` | No | Sobrescribe el nombre del modelo de embeddings para búsqueda vectorial (ej. `nomic-embed-text`, `bge-m3` para servidores locales). Por defecto: `gemini-embedding-001`. |
 
 > ⚠️ El `.env` contiene tu API key y rutas locales. Está en `.gitignore` para no subirse a git. Usa `.env.example` como plantilla.
 
@@ -267,14 +267,27 @@ El daemon integra un motor de **AutoLinker** inverso que resuelve esto de forma 
 
 ---
 
-## 🧠 Embeddings Locales para Búsqueda Semántica (Vector Search)
+## 🧠 Búsqueda Semántica (Vector Embeddings)
 
-Además de la vinculación explícita por nombres y entidades, el daemon incorpora un subsistema de base de datos vectorial local impulsado por **ChromaDB** y el modelo **`text-embedding-004`** de Google:
+Además de la vinculación explícita por nombres y entidades, el daemon vectoriza las notas de wiki generadas y encuentra conceptos semánticamente relacionados usando el modelo **`gemini-embedding-001`** de Google, guardando los vectores en **SQLite** (el mismo `ingestion_state.db` que ya usa el daemon).
+
+### Por qué abandonamos ChromaDB
+
+La implementación original usaba **ChromaDB** con un índice HNSW para la búsqueda vectorial. En la práctica esto generó un problema real: ChromaDB depende de librerías con extensiones nativas (`onnxruntime`, `hnswlib`) que no publican wheels precompilados para `musl` (la librería C que usa Alpine Linux). Sobre la imagen Docker del proyecto, basada en Alpine, `pip` tenía que **compilar esas librerías desde código fuente** en cada build — eso agotaba varios GB de disco y hacía fallar directamente el `docker compose build`.
+
+A eso se sumó que Google deprecó `text-embedding-004` (el modelo que este proyecto llamaba originalmente) en enero de 2026, así que la implementación vieja dejó de funcionar independientemente del problema de disco.
+
+En vez de solo cambiar la imagen base, revisamos si hacía falta una base de datos vectorial dedicada. Para una bóveda personal de Obsidian (de cientos a unos pocos miles de notas), no hace falta: una búsqueda por similitud coseno "a fuerza bruta" sobre todos los vectores guardados, usando `numpy`, corre en una fracción de segundo. Por eso la solución elimina esa pieza extra por completo:
+
+- **Sin ChromaDB, sin dependencias nativas de ML.** `requirements.txt` ya no necesita `chromadb`; solo se agregó `numpy`, que tiene wheels precompilados livianos.
+- **`gemini-embedding-001` en vez del deprecado `text-embedding-004`** — actualmente el modelo mejor rankeado de Google en el leaderboard MTEB Multilingüe, llamado a través del mismo cliente compatible con OpenAI que el proyecto ya usa para generar texto.
+- **Los vectores viven en SQLite**, no en una base de datos embebida aparte — un servicio menos, una cosa menos para respaldar o que se corrompa.
+- **`python:3.12-slim` en vez de `python:3.12-alpine`** en el `Dockerfile` (build multi-stage) — las imágenes basadas en Debian tienen wheels precompilados para prácticamente todo en PyPI, así que `pip install` ya no compila nada desde código fuente.
 
 ### 1. ¿Cómo funciona?
-- **Almacenamiento Local Persistente:** Los vectores e índices se almacenan directamente dentro de tu vault en `.obsidian/plugins/karpathywiki/chroma_db` mediante un índice HNSW con métrica de similitud coseno (`cosine`). Es 100% privado, local y sin costos de bases de datos en la nube ni servicios de terceros.
-- **Indexación Integral de Conocimiento:** Cada entrada generada (`wiki/sources/`, `wiki/concepts/`, `wiki/entities/`) se vectoriza y almacena junto a su metadato de clasificación (`{"type": "concept" | "source" | "entity"}`).
-- **Descubrimiento Conceptual Autónomo:** Cuando se genera o actualiza una nota de concepto, el daemon consulta automáticamente en ChromaDB los 3 conceptos conceptualmente más próximos (`top_k=3`) e inyecta al final del archivo una sección con enlaces wiki:
+- **Almacenamiento Local:** Los vectores se guardan como BLOB en `.obsidian/plugins/karpathywiki/ingestion_state.db`, en una tabla `embeddings` junto a las tablas de estado de ingesta que ya existían. No requiere una base de datos vectorial en la nube ni servicios de terceros — solo el *cálculo* del embedding ocurre online, vía la misma API de Gemini que ya usás para generar texto.
+- **Indexación Integral de Conocimiento:** Cada entrada generada (`wiki/sources/`, `wiki/concepts/`, `wiki/entities/`) se vectoriza y almacena junto a su `doc_type` (`concept` | `source` | `entity`).
+- **Descubrimiento Conceptual Autónomo:** Cuando se genera o actualiza una nota de concepto, el daemon calcula la similitud coseno en memoria contra todos los vectores guardados con tipo `concept` y agrega los 3 más próximos (`top_k=3`) al final del archivo:
   ```markdown
   ### 🧠 Conceptos Relacionados Semánticamente
   - [[wiki/concepts/principio-de-energia-libre|Principio De Energia Libre]]
@@ -289,7 +302,7 @@ Añade la siguiente variable a tu `.env`:
 ```ini
 ENABLE_VECTOR_SEARCH=true
 ```
-*(Requiere `chromadb>=0.4.0` en `requirements.txt`).*
+No requiere dependencias de sistema adicionales más allá de lo que ya está en `requirements.txt`.
 
 ---
 
@@ -317,7 +330,7 @@ EMBEDDING_MODEL_NAME=nomic-embed-text
 # Sin esperas de limitación de tasa para inferencia local
 REQUEST_INTERVAL=0
 
-# Búsqueda vectorial local con ChromaDB
+# Búsqueda vectorial (los vectores se guardan localmente en SQLite igual)
 ENABLE_VECTOR_SEARCH=true
 ```
 

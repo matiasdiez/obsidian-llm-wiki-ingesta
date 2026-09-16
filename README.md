@@ -26,7 +26,7 @@ This companion daemon provides:
 5. **100% Free-Tier Friendly:** Specifically engineered to operate reliably within Google Gemini Free Tier quotas (500 requests/day, 15 RPM) using smart proactive throttling (`REQUEST_INTERVAL=120s`) and dynamic exponential backoff.
 6. **Idempotent Incremental Ingestion:** Maintains an SQLite state database (`ingestion_state.db`) tracking SHA-256 hashes for every note. Notes are only processed when their content changes; unchanged notes cost 0 tokens.
 7. **Cross-Platform Docker Reliability:** Auto-detects runtime environment and falls back to `PollingObserver` on macOS/Windows Docker mounts where native `inotify` events do not propagate.
-8. **🧠 Local Vector Embeddings (Semantic Search):** Powered by ChromaDB and Google's `text-embedding-004`. Embeds and indexes your generated wiki notes locally, discovering non-obvious conceptual links and automatically injecting semantically related concepts.
+8. **🧠 Semantic Search (Vector Embeddings):** Powered by Google's `gemini-embedding-001` and stored in SQLite (no ChromaDB, no extra disk-heavy dependencies). Embeds your generated wiki notes and discovers non-obvious conceptual links, automatically injecting semantically related concepts.
 9. **🏠 Plug-and-Play Local Models (Ollama / LM Studio):** Run 100% offline without API keys or costs. Seamlessly points to any OpenAI-compatible local server (`OPENAI_BASE_URL`), auto-injects dummy API keys for localhost, and features a transparent fallback from JSON Schema to standard `json_object` + Pydantic validation if the local engine does not support `beta.chat.completions.parse`.
 10. **🔔 Native Desktop Notifications:** Receive instant, non-intrusive OS notifications (via `plyer`) summarizing newly extracted concepts and entities as you write. Features a resilient fallback that gracefully ignores display errors in headless or Docker environments.
 
@@ -133,11 +133,11 @@ tail -f /path/to/your/vault/karpathy_ingest.log
 | `REQUEST_INTERVAL` | No | `120` | Minimum seconds between consecutive API calls. Recommended: `120` (Free tier) or `6` (Paid tier). |
 | `WATCHED_FOLDERS` | No | *from plugin* | Comma-separated list of folders to watch within the vault. If unset, automatically reads `watchedFolders` from `.obsidian/plugins/karpathywiki/data.json`, or monitors the whole vault. |
 | `ENABLE_AUTO_LINK` | No | `false` | Scans old notes and injects `[[wiki]]` links magically when new concepts/entities are generated. |
-| `ENABLE_VECTOR_SEARCH` | No | `false` | Generates local embeddings via Gemini `text-embedding-004` (or local embedding model) and stores them in ChromaDB. Automatically appends "Semantically Related Concepts" to new concepts. |
+| `ENABLE_VECTOR_SEARCH` | No | `false` | Generates embeddings via Gemini `gemini-embedding-001` (or a local embedding model) and stores them in SQLite (`ingestion_state.db`). Automatically appends "Semantically Related Concepts" to new concepts. |
 | `ENABLE_NOTIFICATIONS` | No | `false` | Sends native OS desktop notifications upon successful extraction (requires running locally, may not work in Docker). |
 | `OPENAI_BASE_URL` | No | *Gemini API* | Custom base URL for OpenAI-compatible local endpoints (e.g., `http://localhost:11434/v1` for Ollama, `http://localhost:1234/v1` for LM Studio). Also accepts `LOCAL_API_BASE_URL`. When pointing to `localhost` or `127.0.0.1`, `GEMINI_API_KEY` is not required. |
 | `MODEL_NAME` | No | `gemini-2.5-flash-lite` | Override LLM model name (e.g., `llama3.1:8b`, `qwen2.5:7b`, `mistral:7b`). |
-| `EMBEDDING_MODEL_NAME` | No | `text-embedding-004` | Override embedding model name for vector search (e.g., `nomic-embed-text`, `bge-m3`, `all-minilm`). |
+| `EMBEDDING_MODEL_NAME` | No | `gemini-embedding-001` | Override embedding model name for vector search (e.g., `nomic-embed-text`, `bge-m3`, `all-minilm` for local servers). |
 
 ---
 
@@ -158,14 +158,26 @@ The daemon features an integrated **AutoLinker** that solves this:
 
 ---
 
-## 🧠 Local Embeddings for Semantic Search (Vector Search)
+## 🧠 Semantic Search (Vector Embeddings)
 
-In addition to literal keyword matching, the daemon integrates a high-performance local vector database powered by **ChromaDB** and Google's **`text-embedding-004`** model:
+In addition to literal keyword matching, the daemon embeds your generated wiki notes and finds semantically related concepts using Google's **`gemini-embedding-001`** model, storing the vectors in **SQLite** (the same `ingestion_state.db` the daemon already uses).
+
+### Why we moved away from ChromaDB
+The original implementation used **ChromaDB** with an HNSW index for vector search. In practice, this caused a real problem: ChromaDB depends on libraries with native extensions (`onnxruntime`, `hnswlib`) that don't ship precompiled wheels for `musl` (the C library Alpine Linux uses). On the project's Alpine-based Docker image, `pip` had to **compile those libraries from source** on every build, which exhausted several GB of disk space and made `docker compose build` fail outright.
+
+On top of that, Google deprecated `text-embedding-004` (the model this project originally called) in January 2026, so the old implementation stopped working independently of the disk issue.
+
+Rather than just swapping the base image, we re-evaluated whether a dedicated vector database was needed at all. For a personal Obsidian vault (hundreds to a few thousand notes), it isn't: a brute-force cosine similarity search over all stored vectors, using `numpy`, runs in a fraction of a second. So the fix removes the extra moving part entirely:
+
+- **No ChromaDB, no native ML dependencies.** `requirements.txt` no longer needs `chromadb`; only `numpy` was added, which has lightweight precompiled wheels.
+- **`gemini-embedding-001` instead of the deprecated `text-embedding-004`** — currently Google's top-ranked model on the MTEB Multilingual leaderboard, called through the same OpenAI-compatible client the project already uses for text generation.
+- **Vectors live in SQLite**, not a separate embedded database — one less service, one less thing to back up or corrupt.
+- **`python:3.12-slim` instead of `python:3.12-alpine`** in the `Dockerfile` (multi-stage build) — Debian-based images have precompiled wheels for virtually everything on PyPI, so `pip install` no longer compiles anything from source.
 
 ### 1. How It Works
-- **100% Local Persistence:** Embeddings and indices are stored locally inside your vault at `.obsidian/plugins/karpathywiki/chroma_db` (using HNSW with cosine distance). No external vector cloud, API subscriptions, or SaaS required.
-- **Universal Knowledge Indexing:** Every generated markdown entry (`wiki/sources/`, `wiki/concepts/`, `wiki/entities/`) is embedded and stored with its respective metadata (`{"type": "concept" | "source" | "entity"}`).
-- **Automatic Conceptual Bridges:** When a new concept note is created or updated, the daemon automatically queries ChromaDB for the top-3 most semantically similar concepts (`top_k=3`) and appends a dedicated section at the bottom of the file:
+- **Local Persistence:** Vectors are stored as BLOBs in `.obsidian/plugins/karpathywiki/ingestion_state.db`, in an `embeddings` table alongside the existing ingestion-state tracking. No external vector cloud or SaaS required — only the embedding *computation* happens online, via the Gemini API you already use for text generation.
+- **Universal Knowledge Indexing:** Every generated markdown entry (`wiki/sources/`, `wiki/concepts/`, `wiki/entities/`) is embedded and stored with its `doc_type` (`concept` | `source` | `entity`).
+- **Automatic Conceptual Bridges:** When a new concept note is created or updated, the daemon computes cosine similarity in-memory against every stored `concept` vector and appends the top-3 matches (`top_k=3`) at the bottom of the file:
   ```markdown
   ### 🧠 Conceptos Relacionados Semánticamente
   - [[wiki/concepts/free-energy-principle|Free Energy Principle]]
@@ -173,14 +185,14 @@ In addition to literal keyword matching, the daemon integrates a high-performanc
   - [[wiki/concepts/bayesian-brain|Bayesian Brain]]
   ```
 - **State Integrity & Anti-Loop:** Because the concept file is modified to include related concepts, the daemon immediately recalculates the final SHA-256 hash and updates `ingestion_state.db`, ensuring that this automated enrichment never triggers an ingestion loop.
-- **Resilient Embedding Retries:** Features automatic exponential backoff retries (up to 3 attempts) for the `text-embedding-004` endpoint to guarantee robust indexation.
+- **Resilient Embedding Retries:** Features automatic exponential backoff retries (up to 3 attempts) for the embeddings endpoint to guarantee robust indexation.
 
 ### 2. Enabling Vector Search
 Add the following variable to your `.env`:
 ```ini
 ENABLE_VECTOR_SEARCH=true
 ```
-*(Requires `chromadb>=0.4.0` in `requirements.txt`).*
+No extra system dependencies required beyond what's already in `requirements.txt`.
 
 ---
 
@@ -208,7 +220,7 @@ EMBEDDING_MODEL_NAME=nomic-embed-text
 # No rate limiting needed for local inference
 REQUEST_INTERVAL=0
 
-# Enable local vector search with ChromaDB
+# Enable vector search (vectors stored locally in SQLite either way)
 ENABLE_VECTOR_SEARCH=true
 ```
 
@@ -265,8 +277,8 @@ Your note in Obsidian
   wiki/entities/  ← People, organizations & authors  Scans old notes & injects [[links]]
        │                                             Updates SHA-256 in SQLite (no loops)
        ▼ [If ENABLE_VECTOR_SEARCH=true]
-  ChromaDB Vector Store:
-  - Generates embeddings with text-embedding-004
+  Vector Store (SQLite):
+  - Generates embeddings with gemini-embedding-001
   - Injects "Semantically Related Concepts" into concept notes
   - Updates note SHA-256 hash in SQLite
 ```

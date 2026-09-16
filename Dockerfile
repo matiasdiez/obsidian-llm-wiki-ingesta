@@ -1,20 +1,26 @@
 # Dockerfile — KarpathyWiki Ingest Daemon
-# Base: python:3.12-alpine (~80 MB en disco final)
+# Base: python:3.12-slim (build multi-stage)
+#
+# Antes usábamos python:3.12-alpine. Alpine usa musl en vez de glibc, y varias
+# dependencias con extensiones nativas (antes: chromadb/onnxruntime/hnswlib)
+# no publican wheels precompilados para musl, así que pip las compilaba desde
+# código fuente en cada build — eso agotaba el espacio en disco.
+# slim (Debian) sí tiene wheels manylinux precompilados: pip solo descarga
+# binarios, no compila nada.
 
-FROM python:3.12-alpine
+# ---- Etapa 1: build ----
+FROM python:3.12-slim AS builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-# Dependencias del sistema necesarias para watchdog/inotify
-RUN apk add --no-cache \
-    gcc \
-    musl-dev \
-    linux-headers
-
-# Directorio de trabajo dentro del contenedor
+# ---- Etapa 2: runtime ----
+FROM python:3.12-slim
 WORKDIR /app
 
-# Copiar e instalar dependencias Python
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copiar solo los paquetes ya instalados de la etapa de build.
+# El toolchain de compilación (si hizo falta) nunca llega a esta imagen.
+COPY --from=builder /install /usr/local
 
 # Copiar el script del daemon
 COPY ingest_daemon.py .

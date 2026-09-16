@@ -3,5 +3,5 @@ watchdog>=4.0.0          # File system event monitoring
 openai>=1.40.0           # OpenAI-compatible client (used for Gemini via OpenAI API)
 python-dotenv>=1.0.0     # Load API key from .env file
 pydantic>=2.0.0          # Data validation for LLM Structured Outputs
-chromadb>=0.4.0          # Local vector database for semantic search
+numpy>=1.26.0            # Cosine similarity for semantic search (stored in SQLite)
 plyer>=2.1.0             # Native desktop notifications

@@ -26,6 +26,7 @@ import os
 import re
 import signal
 import sqlite3
+import struct
 import sys
 import threading
 import time
@@ -33,6 +34,11 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+try:
+    import numpy as np
+except ImportError:
+    sys.exit("❌  Missing dependency: run  pip install numpy")
 
 # ---------------------------------------------------------------------------
 # Third-party imports (graceful error if not installed)
@@ -132,7 +138,9 @@ class Config:
 
     @property
     def embedding_model(self) -> str:
-        return os.environ.get("EMBEDDING_MODEL_NAME") or "text-embedding-004"
+        # text-embedding-004 fue deprecado por Google en enero de 2026.
+        # gemini-embedding-001 es el modelo vigente (líder actual en MTEB Multilingual).
+        return os.environ.get("EMBEDDING_MODEL_NAME") or "gemini-embedding-001"
 
     @property
     def wiki_folder(self) -> str:
@@ -238,6 +246,13 @@ class IngestionStateDB:
         last_processed_at      TEXT NOT NULL,
         status                 TEXT NOT NULL DEFAULT 'ok'
     );
+
+    CREATE TABLE IF NOT EXISTS embeddings (
+        file_path               TEXT PRIMARY KEY,
+        doc_type                TEXT NOT NULL,
+        vector                  BLOB NOT NULL,
+        updated_at               TEXT NOT NULL
+    );
     """
 
     def __init__(self, db_path: Path) -> None:
@@ -249,8 +264,32 @@ class IngestionStateDB:
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
         
-        self._conn.execute(self.DDL)
+        self._conn.executescript(self.DDL)
         self._conn.commit()
+
+    # -- Embeddings (reemplaza el almacén separado de ChromaDB) -------------
+    def upsert_embedding(self, file_path: str, doc_type: str, vector_blob: bytes) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO embeddings (file_path, doc_type, vector, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(file_path) DO UPDATE SET
+                    doc_type   = excluded.doc_type,
+                    vector     = excluded.vector,
+                    updated_at = excluded.updated_at
+                """,
+                (file_path, doc_type, vector_blob, now),
+            )
+            self._conn.commit()
+
+    def get_embeddings_by_type(self, doc_type: str) -> list[tuple[str, bytes]]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT file_path, vector FROM embeddings WHERE doc_type = ?",
+                (doc_type,),
+            ).fetchall()
 
     def get_hash(self, file_path: str) -> str | None:
         with self._lock:
@@ -636,27 +675,23 @@ class AutoLinker:
                 self._is_running = False
 
 # ---------------------------------------------------------------------------
-# Vector Store (ChromaDB para Búsqueda Semántica)
+# Vector Store (SQLite + API de Embeddings de Gemini para Búsqueda Semántica)
 # ---------------------------------------------------------------------------
+# Reemplaza la implementación anterior basada en ChromaDB. Motivo del cambio:
+# ChromaDB depende de librerías con extensiones nativas (onnxruntime, hnswlib)
+# que en imágenes Alpine se compilan desde código fuente por falta de wheels
+# precompilados para musl, lo que agotaba el espacio en disco durante el build
+# de Docker. Como el proyecto ya calcula los embeddings vía la API de Gemini
+# (no localmente), no hacía falta un motor de índice vectorial: a la escala de
+# una bóveda personal (cientos/miles de notas), comparar contra todos los
+# vectores con similitud coseno es prácticamente instantáneo. Los vectores se
+# guardan en el mismo `ingestion_state.db` que ya usa el daemon.
 class VectorStore:
-    def __init__(self, config: Config, client: AsyncOpenAI, logger: logging.Logger):
+    def __init__(self, config: Config, client: AsyncOpenAI, logger: logging.Logger, db: IngestionStateDB):
         self.config = config
         self.client = client
         self.logger = logger
-        
-        try:
-            import chromadb
-            self.chromadb = chromadb
-        except ImportError:
-            self.logger.error("❌ chromadb no está instalado. Ejecuta: pip install chromadb")
-            sys.exit(1)
-            
-        chroma_path = self.config.vault / ".obsidian" / "plugins" / "karpathywiki" / "chroma_db"
-        self.chroma_client = self.chromadb.PersistentClient(path=str(chroma_path))
-        self.collection = self.chroma_client.get_or_create_collection(
-            name="wiki_knowledge",
-            metadata={"hnsw:space": "cosine"}
-        )
+        self.db = db
 
     async def _get_embedding(self, text: str) -> list[float]:
         for attempt in range(3):
@@ -677,13 +712,8 @@ class VectorStore:
         rel_id = str(file_path.relative_to(self.config.vault))
         try:
             emb = await self._get_embedding(content)
-            await asyncio.to_thread(
-                self.collection.upsert,
-                ids=[rel_id],
-                embeddings=[emb],
-                documents=[content],
-                metadatas=[{"type": doc_type}]
-            )
+            blob = struct.pack(f"{len(emb)}f", *emb)
+            await asyncio.to_thread(self.db.upsert_embedding, rel_id, doc_type, blob)
             self.logger.debug("  🧠 Embedding guardado para %s", rel_id)
         except Exception as e:
             self.logger.error("Fallo al guardar embedding de %s: %s", rel_id, e)
@@ -691,21 +721,24 @@ class VectorStore:
     async def find_related_concepts(self, file_path: Path, content: str, top_k: int = 3) -> list[str]:
         rel_id = str(file_path.relative_to(self.config.vault))
         try:
-            emb = await self._get_embedding(content)
-            results = await asyncio.to_thread(
-                self.collection.query,
-                query_embeddings=[emb],
-                n_results=top_k + 1,
-                where={"type": "concept"}
-            )
-            
+            emb = np.array(await self._get_embedding(content), dtype=np.float32)
+            rows = await asyncio.to_thread(self.db.get_embeddings_by_type, "concept")
+
+            scored: list[tuple[str, float]] = []
+            for path, blob in rows:
+                if path == rel_id:
+                    continue
+                vec = np.frombuffer(blob, dtype=np.float32)
+                denom = float(np.linalg.norm(emb) * np.linalg.norm(vec))
+                sim = float(np.dot(emb, vec) / denom) if denom else 0.0
+                scored.append((path, sim))
+            scored.sort(key=lambda x: x[1], reverse=True)
+
             related = []
-            if results and results["ids"]:
-                for match_id in results["ids"][0]:
-                    if match_id != rel_id and len(related) < top_k:
-                        target = match_id.replace(".md", "")
-                        name = target.split("/")[-1].replace("-", " ").title()
-                        related.append(f"[[{target}|{name}]]")
+            for match_id, _score in scored[:top_k]:
+                target = match_id.replace(".md", "")
+                name = target.split("/")[-1].replace("-", " ").title()
+                related.append(f"[[{target}|{name}]]")
             return related
         except Exception as e:
             self.logger.error("Fallo al buscar conceptos relacionados para %s: %s", rel_id, e)
@@ -989,7 +1022,7 @@ async def async_main(args: argparse.Namespace, vault_path: Path) -> None:
     generator = WikiGenerator(config, logger)
     writer    = WikiWriter(config, logger)
     auto_linker = AutoLinker(config, db, logger)
-    vector_store = VectorStore(config, generator._client, logger) if config.vector_search_enabled else None
+    vector_store = VectorStore(config, generator._client, logger, db) if config.vector_search_enabled else None
     notifier = Notifier(config, logger)
     pipeline  = IngestionPipeline(config, db, generator, writer, logger, auto_linker, vector_store, notifier)
 
